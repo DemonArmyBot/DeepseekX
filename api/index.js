@@ -114,7 +114,7 @@ function estimateTokens(text) {
   return Math.max(1, Math.ceil(String(text).trim().split(/s+/).length * 1.3));
 }
 
-// ─── Session boot (same as your Python script) ───────────────────────────────
+// ─── Session boot (matches your Python script) ───────────────────────────────
 
 async function initSession() {
   const now = Date.now();
@@ -250,7 +250,6 @@ function simulateStream(res, content, model) {
     res.end();
   }, 40);
 
-  // Cleanup on disconnect
   res.on('close', () => clearInterval(interval));
   res.on('finish', () => clearInterval(interval));
   res.on('error', () => clearInterval(interval));
@@ -386,7 +385,7 @@ async function handleChat(req, res) {
   });
 }
 
-// ─── Vercel handler ──────────────────────────────────────────────────────────
+// ─── Vercel handler (root‑mounted) ───────────────────────────────────────────
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
