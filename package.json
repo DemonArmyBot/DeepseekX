@@ -1,12 +1,10 @@
 {
-  "name": "deepseek-asmodeus-proxy",
-  "version": "3.0.0",
-  "main": "index.js",
-  "scripts": {
-    "dev": "vercel dev"
-  },
+  "name": "deepseek-vercel-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "main": "api/index.js",
   "dependencies": {
-    "axios": "^1.7.2",
+    "axios": "^1.9.0",
     "crypto-js": "^4.2.0"
   }
 }
