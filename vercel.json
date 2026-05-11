@@ -7,8 +7,8 @@
     }
   ],
   "routes": [
-    { "src": "/v1/chat/completions", "dest": "/api/index" },
     { "src": "/v1/models", "dest": "/api/index" },
+    { "src": "/v1/chat/completions", "dest": "/api/index" },
     { "src": "/api/(.*)", "dest": "/api/index" },
     { "src": "/(.*)", "dest": "/api/index" }
   ]
