@@ -5,173 +5,251 @@ let globalSession = null;
 let lastInitTime = 0;
 
 const MODELS = [
-  "DeepSeek-V3", "DeepSeek-V3.1", "DeepSeek-V3.2", "DeepSeek-R1",
-  "DeepSeek-R1-0528", "DeepSeek-Coder-V2", "DeepSeek-Prover-V2",
-  "DeepSeek-V2.5", "DeepSeek-VL"
+  "DeepSeek-V3",
+  "DeepSeek-V3.1",
+  "DeepSeek-V3.2",
+  "DeepSeek-R1",
+  "DeepSeek-R1-0528",
+  "DeepSeek-Coder-V2",
+  "DeepSeek-Prover-V2",
+  "DeepSeek-V2.5",
+  "DeepSeek-VL"
 ];
+
+// ─── Session Management ────────────────────────────────────────────────────────
 
 async function initSession() {
   const now = Date.now();
-  if (globalSession && (now - lastInitTime < 300000)) return globalSession; // 5 min cache
+  if (globalSession && now - lastInitTime < 300000) {
+    return globalSession; // reuse if < 5 min old
+  }
 
   console.log("🔄 Initializing new Asmodeus session...");
 
   const session = axios.create({
     headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36'
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
     },
     maxRedirects: 5,
-    timeout: 30000
+    timeout: 30000,
   });
 
-  // Get main page
+  // Step 1: Load main page to extract AES params
   const mainPage = await session.get('https://asmodeus.free.nf/');
   const matches = mainPage.data.match(/toNumbers\("([a-f0-9]+)"\)/g);
 
   if (!matches || matches.length < 3) {
-    throw new Error("Failed to extract encryption data");
+    throw new Error("Failed to extract encryption data from main page");
   }
 
   const nums = matches.map(m => m.match(/([a-f0-9]+)/)[1]);
-  const key = CryptoJS.enc.Hex.parse(nums[0]);
-  const iv = CryptoJS.enc.Hex.parse(nums[1]);
+  const key  = CryptoJS.enc.Hex.parse(nums[0]);
+  const iv   = CryptoJS.enc.Hex.parse(nums[1]);
   const data = CryptoJS.enc.Hex.parse(nums[2]);
 
   const decrypted = CryptoJS.AES.decrypt(
     { ciphertext: data },
     key,
-    { iv: iv }
+    { iv }
   ).toString(CryptoJS.enc.Utf8);
 
-  // Set cookie
-  session.defaults.headers.Cookie = `__test=${decrypted}`;
+  if (!decrypted) {
+    throw new Error("AES decryption returned empty string");
+  }
 
+  // Step 2: Set cookie and confirm session
+  session.defaults.headers['Cookie'] = `__test=${decrypted}`;
   await session.get('https://asmodeus.free.nf/index.php?i=1');
 
   globalSession = session;
-  lastInitTime = now;
+  lastInitTime  = now;
   console.log("✅ Session initialized successfully");
   return session;
 }
 
-function simulateStream(res, content) {
+// ─── Streaming Helper ──────────────────────────────────────────────────────────
+
+function simulateStream(res, content, model) {
   const words = content.split(' ');
   let i = 0;
+  const id = "chatcmpl-" + Date.now();
 
   const interval = setInterval(() => {
     if (i < words.length) {
       const chunk = {
-        id: "chatcmpl-" + Date.now(),
+        id,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: "DeepSeek-V3",
+        model,
         choices: [{
-          delta: { content: words[i] + " " },
+          delta: { content: (i === 0 ? '' : ' ') + words[i] },
           index: 0,
-          finish_reason: null
-        }]
+          finish_reason: null,
+        }],
       };
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       i++;
     } else {
       const done = {
-        id: "chatcmpl-" + Date.now(),
+        id,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
-        model: "DeepSeek-V3",
+        model,
         choices: [{
           delta: {},
           index: 0,
-          finish_reason: "stop"
-        }]
+          finish_reason: "stop",
+        }],
       };
       res.write(`data: ${JSON.stringify(done)}\n\n`);
       res.write('data: [DONE]\n\n');
       clearInterval(interval);
       res.end();
     }
-  }, 40); // \~25 tokens/sec feel
+  }, 40);
 }
 
+// ─── Route Helpers ─────────────────────────────────────────────────────────────
+
+function isModelsRoute(url, method) {
+  // GET /v1/models  |  GET /api/v1/models  |  GET /models
+  return method === 'GET' && /\/models/.test(url);
+}
+
+function isChatRoute(url, method) {
+  // POST /v1/chat/completions  |  POST /api/v1/chat/completions
+  return method === 'POST' && /\/chat\/completions/.test(url);
+}
+
+function isRootRoute(url, method) {
+  return method === 'GET' && (url === '/' || url === '/api' || url === '/api/');
+}
+
+// ─── Main Handler ──────────────────────────────────────────────────────────────
+
 module.exports = async (req, res) => {
+  // CORS headers — always set first
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
-  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
 
-  // Models endpoint
-  if (req.url.includes('/v1/models') || req.method === 'GET') {
-    return res.json({
+  const { url = '/', method } = req;
+  console.log(`→ ${method} ${url}`);
+
+  // ── Root ping ────────────────────────────────────────────────────────────────
+  if (isRootRoute(url, method)) {
+    return res.status(200).json({
+      status: "ok",
+      message: "DeepSeek Proxy is running",
+      endpoints: {
+        models: "GET /v1/models",
+        chat: "POST /v1/chat/completions",
+      },
+    });
+  }
+
+  // ── GET /v1/models ───────────────────────────────────────────────────────────
+  if (isModelsRoute(url, method)) {
+    return res.status(200).json({
       object: "list",
       data: MODELS.map(m => ({
         id: m,
         object: "model",
         created: 1710000000,
-        owned_by: "deepseek"
-      }))
+        owned_by: "deepseek",
+      })),
     });
   }
 
-  // Chat completions
-  if (req.method !== 'POST') return res.status(405).json({ error: "Method not allowed" });
+  // ── POST /v1/chat/completions ────────────────────────────────────────────────
+  if (isChatRoute(url, method)) {
+    try {
+      const { model = "DeepSeek-V3", messages, stream = false } = req.body || {};
 
-  try {
-    const { model = "DeepSeek-V3", messages, stream = false } = req.body;
+      if (!messages || !Array.isArray(messages) || messages.length === 0) {
+        return res.status(400).json({
+          error: { message: "messages array is required and must not be empty", type: "invalid_request_error" },
+        });
+      }
 
-    if (!messages || !messages.length) {
-      return res.status(400).json({ error: "Messages are required" });
-    }
+      const session = await initSession();
 
-    const session = await initSession();
+      // Build conversation string for the proxy
+      const historyPrompt = messages
+        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+        .join('\n\n');
 
-    // Combine history into one prompt
-    const historyPrompt = messages.map(m => {
-      return `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`;
-    }).join('\n\n');
+      const response = await session.post(
+        'https://asmodeus.free.nf/deepseek.php',
+        { model, question: historyPrompt },
+        { params: { i: '1' } }
+      );
 
-    const response = await session.post(
-      'https://asmodeus.free.nf/deepseek.php',
-      {
-        model: model,
-        question: historyPrompt
-      },
-      { params: { i: '1' } }
-    );
+      // Try to parse the response div
+      const match = response.data.match(/<div class="response-content">([\s\S]*?)<\/div>/);
+      const content = match
+        ? match[1].trim()
+        : (typeof response.data === 'string' ? response.data.trim() : "No response from proxy.");
 
-    const match = response.data.match(/<div class="response-content">(.*?)<\/div>/s);
-    const content = match ? match[1].trim() : "No response from proxy.";
+      if (!content) {
+        throw new Error("Empty content received from upstream proxy");
+      }
 
-    if (stream) {
-      res.setHeader('Content-Type', 'text/event-stream');
-      res.setHeader('Cache-Control', 'no-cache');
-      res.setHeader('Connection', 'keep-alive');
-      simulateStream(res, content);
-    } else {
-      res.json({
+      // ── Streaming response ──────────────────────────────────────────────────
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        return simulateStream(res, content, model);
+      }
+
+      // ── Non-streaming response ──────────────────────────────────────────────
+      return res.status(200).json({
         id: "chatcmpl-" + Date.now(),
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
-        model: model,
+        model,
         choices: [{
           index: 0,
-          message: { role: "assistant", content: content },
-          finish_reason: "stop"
-        }]
+          message: { role: "assistant", content },
+          finish_reason: "stop",
+        }],
+        usage: {
+          prompt_tokens: historyPrompt.split(' ').length,
+          completion_tokens: content.split(' ').length,
+          total_tokens: historyPrompt.split(' ').length + content.split(' ').length,
+        },
+      });
+
+    } catch (error) {
+      console.error("❌ Proxy Error:", error.message);
+      globalSession = null; // force re-init on next request
+
+      return res.status(500).json({
+        error: {
+          message: error.message || "Internal proxy error",
+          type: "proxy_error",
+        },
       });
     }
-
-  } catch (error) {
-    console.error("Proxy Error:", error.message);
-    
-    // Auto refresh session on failure
-    globalSession = null;
-    
-    res.status(500).json({
-      error: {
-        message: error.message || "Internal proxy error",
-        type: "proxy_error"
-      }
-    });
   }
+
+  // ── Fallback 404 ─────────────────────────────────────────────────────────────
+  return res.status(404).json({
+    error: {
+      message: `Route not found: ${method} ${url}`,
+      type: "not_found",
+      valid_routes: [
+        "GET  /v1/models",
+        "POST /v1/chat/completions",
+      ],
+    },
+  });
 };
