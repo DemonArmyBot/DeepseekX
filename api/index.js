@@ -4,134 +4,405 @@ const CryptoJS = require('crypto-js');
 let globalSession = null;
 let lastInitTime = 0;
 
+const SESSION_TTL_MS = 5 * 60 * 1000;
+
 const MODELS = [
-  "DeepSeek-V3",
-  "DeepSeek-V3.1",
-  "DeepSeek-V3.2",
-  "DeepSeek-R1",
-  "DeepSeek-R1-0528",
-  "DeepSeek-Coder-V2",
-  "DeepSeek-Prover-V2",
-  "DeepSeek-V2.5",
-  "DeepSeek-VL"
+  'DeepSeek-V3',
+  'DeepSeek-V3.1',
+  'DeepSeek-V3.2',
+  'DeepSeek-R1',
+  'DeepSeek-R1-0528',
+  'DeepSeek-Coder-V2',
+  'DeepSeek-Prover-V2',
+  'DeepSeek-V2.5',
+  'DeepSeek-VL',
 ];
 
-// ─── Session Management ────────────────────────────────────────────────────────
+function getPath(req) {
+  if (req.query && typeof req.query.path === 'string') return req.query.path;
+  if (Array.isArray(req.query?.path)) return `/${req.query.path.join('/')}`;
+  try {
+    const url = new URL(req.url, 'http://localhost');
+    return url.pathname || '/';
+  } catch {
+    return req.url || '/';
+  }
+}
+
+function safeJsonBody(req, res) {
+  try {
+    return req.body || {};
+  } catch {
+    res.status(400).json({
+      error: {
+        message: 'Invalid JSON body',
+        type: 'invalid_request_error',
+      },
+    });
+    return null;
+  }
+}
+
+function stripHtml(html) {
+  return String(html)
+    .replace(/<brs*/?>/gi, '
+')
+    .replace(/</p>/gi, '
+')
+    .replace(/<li>/gi, '- ')
+    .replace(/</li>/gi, '
+')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/
+{3,}/g, '
+
+')
+    .trim();
+}
+
+function normalizeMessageContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (part && typeof part.text === 'string') return part.text;
+        return '';
+      })
+      .filter(Boolean)
+      .join('
+');
+  }
+  return '';
+}
+
+function buildPrompt(messages) {
+  return messages
+    .map((m) => {
+      const role =
+        m.role === 'system'
+          ? 'System'
+          : m.role === 'assistant'
+          ? 'Assistant'
+          : 'User';
+      return `${role}: ${normalizeMessageContent(m.content)}`;
+    })
+    .join('
+
+');
+}
+
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.max(1, Math.ceil(String(text).trim().split(/s+/).length * 1.3));
+}
 
 async function initSession() {
   const now = Date.now();
-  if (globalSession && now - lastInitTime < 300000) {
-    return globalSession; // reuse if < 5 min old
+  if (globalSession && now - lastInitTime < SESSION_TTL_MS) {
+    return globalSession;
   }
 
-  console.log("🔄 Initializing new Asmodeus session...");
+  console.log('Initializing new Asmodeus session...');
 
   const session = axios.create({
     headers: {
       'User-Agent':
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.5',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      Connection: 'keep-alive',
+      'Upgrade-Insecure-Requests': '1',
+      'Sec-Fetch-Dest': 'document',
+      'Sec-Fetch-Mode': 'navigate',
+      'Sec-Fetch-Site': 'none',
+      'Sec-Fetch-User': '?1',
+      'sec-ch-ua':
+        '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+      'sec-ch-ua-mobile': '?0',
+      'sec-ch-ua-platform': '"Windows"',
+      'Cache-Control': 'max-age=0',
     },
-    maxRedirects: 5,
+    maxRedirects: 10,
     timeout: 30000,
+    validateStatus: () => true,
   });
 
-  // Step 1: Load main page to extract AES params
-  const mainPage = await session.get('https://asmodeus.free.nf/');
-  const matches = mainPage.data.match(/toNumbers\("([a-f0-9]+)"\)/g);
-
-  if (!matches || matches.length < 3) {
-    throw new Error("Failed to extract encryption data from main page");
+  let mainPage;
+  try {
+    mainPage = await session.get('https://asmodeus.free.nf/');
+  } catch (e) {
+    throw new Error(`Network error reaching asmodeus.free.nf: ${e.message}`);
   }
 
-  const nums = matches.map(m => m.match(/([a-f0-9]+)/)[1]);
-  const key  = CryptoJS.enc.Hex.parse(nums[0]);
-  const iv   = CryptoJS.enc.Hex.parse(nums[1]);
+  const bodyText = String(mainPage.data || '');
+  console.log(`Main page status: ${mainPage.status}`);
+  console.log(`Body preview: ${bodyText.slice(0, 400)}`);
+
+  if (mainPage.status === 403) {
+    throw new Error(
+      'asmodeus.free.nf returned 403 Forbidden. The upstream may be blocking serverless/Vercel IPs.'
+    );
+  }
+
+  if (mainPage.status !== 200) {
+    throw new Error(
+      `asmodeus.free.nf returned HTTP ${mainPage.status}. Body: ${bodyText.slice(0, 200)}`
+    );
+  }
+
+  const matches = bodyText.match(/toNumbers("([a-f0-9]+)")/gi);
+  if (!matches || matches.length < 3) {
+    throw new Error(
+      `Could not find AES params in upstream HTML. Body starts: ${bodyText.slice(0, 300)}`
+    );
+  }
+
+  const nums = matches.map((m) => {
+    const found = m.match(/([a-f0-9]+)/i);
+    return found ? found[1] : '';
+  });
+
+  if (nums.some((v) => !v)) {
+    throw new Error('Failed to extract one or more AES parameters.');
+  }
+
+  const key = CryptoJS.enc.Hex.parse(nums[0]);
+  const iv = CryptoJS.enc.Hex.parse(nums[1]);
   const data = CryptoJS.enc.Hex.parse(nums[2]);
 
-  const decrypted = CryptoJS.AES.decrypt(
-    { ciphertext: data },
-    key,
-    { iv }
-  ).toString(CryptoJS.enc.Utf8);
-
-  if (!decrypted) {
-    throw new Error("AES decryption returned empty string");
+  let decrypted = '';
+  try {
+    decrypted = CryptoJS.AES.decrypt({ ciphertext: data }, key, { iv }).toString(
+      CryptoJS.enc.Utf8
+    );
+  } catch (e) {
+    throw new Error(`AES decrypt threw: ${e.message}`);
   }
 
-  // Step 2: Set cookie and confirm session
-  session.defaults.headers['Cookie'] = `__test=${decrypted}`;
-  await session.get('https://asmodeus.free.nf/index.php?i=1');
+  if (!decrypted) {
+    throw new Error('AES decryption returned an empty cookie value.');
+  }
+
+  session.defaults.headers.Cookie = `__test=${decrypted}`;
+  session.defaults.headers.Referer = 'https://asmodeus.free.nf/';
+  session.defaults.headers.Origin = 'https://asmodeus.free.nf';
+
+  const confirm = await session.get('https://asmodeus.free.nf/index.php?i=1');
+  console.log(`Session confirm status: ${confirm.status}`);
 
   globalSession = session;
-  lastInitTime  = now;
-  console.log("✅ Session initialized successfully");
+  lastInitTime = now;
+
   return session;
 }
 
-// ─── Streaming Helper ──────────────────────────────────────────────────────────
+function writeSseChunk(res, payload) {
+  res.write(`data: ${JSON.stringify(payload)}
+
+`);
+}
 
 function simulateStream(res, content, model) {
-  const words = content.split(' ');
+  const words = String(content).split(/s+/).filter(Boolean);
+  const id = `chatcmpl-${Date.now()}`;
   let i = 0;
-  const id = "chatcmpl-" + Date.now();
 
   const interval = setInterval(() => {
     if (i < words.length) {
-      const chunk = {
+      writeSseChunk(res, {
         id,
-        object: "chat.completion.chunk",
+        object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model,
-        choices: [{
-          delta: { content: (i === 0 ? '' : ' ') + words[i] },
-          index: 0,
-          finish_reason: null,
-        }],
-      };
-      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-      i++;
-    } else {
-      const done = {
-        id,
-        object: "chat.completion.chunk",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
+        choices: [
+          {
+            delta: { content: `${i === 0 ? '' : ' '}${words[i]}` },
+            index: 0,
+            finish_reason: null,
+          },
+        ],
+      });
+      i += 1;
+      return;
+    }
+
+    writeSseChunk(res, {
+      id,
+      object: 'chat.completion.chunk',
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [
+        {
           delta: {},
           index: 0,
-          finish_reason: "stop",
-        }],
-      };
-      res.write(`data: ${JSON.stringify(done)}\n\n`);
-      res.write('data: [DONE]\n\n');
-      clearInterval(interval);
-      res.end();
-    }
+          finish_reason: 'stop',
+        },
+      ],
+    });
+    res.write('data: [DONE]
+
+');
+    clearInterval(interval);
+    res.end();
   }, 40);
+
+  reqCleanup(res, () => clearInterval(interval));
 }
 
-// ─── Route Helpers ─────────────────────────────────────────────────────────────
-
-function isModelsRoute(url, method) {
-  // GET /v1/models  |  GET /api/v1/models  |  GET /models
-  return method === 'GET' && /\/models/.test(url);
+function reqCleanup(res, fn) {
+  res.on('close', fn);
+  res.on('finish', fn);
+  res.on('error', fn);
 }
 
-function isChatRoute(url, method) {
-  // POST /v1/chat/completions  |  POST /api/v1/chat/completions
-  return method === 'POST' && /\/chat\/completions/.test(url);
-}
+async function handleChat(req, res) {
+  const body = safeJsonBody(req, res);
+  if (!body) return;
 
-function isRootRoute(url, method) {
-  return method === 'GET' && (url === '/' || url === '/api' || url === '/api/');
-}
+  const { model = 'DeepSeek-V3', messages, stream = false } = body;
 
-// ─── Main Handler ──────────────────────────────────────────────────────────────
+  if (!MODELS.includes(model)) {
+    return res.status(400).json({
+      error: {
+        message: `Unsupported model "${model}"`,
+        type: 'invalid_request_error',
+      },
+    });
+  }
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({
+      error: {
+        message: 'messages array is required and must not be empty',
+        type: 'invalid_request_error',
+      },
+    });
+  }
+
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') {
+      return res.status(400).json({
+        error: {
+          message: 'Each message must be an object',
+          type: 'invalid_request_error',
+        },
+      });
+    }
+
+    if (!['system', 'user', 'assistant'].includes(m.role)) {
+      return res.status(400).json({
+        error: {
+          message: 'Each message.role must be system, user, or assistant',
+          type: 'invalid_request_error',
+        },
+      });
+    }
+
+    const content = normalizeMessageContent(m.content);
+    if (!content) {
+      return res.status(400).json({
+        error: {
+          message: 'Each message.content must be a non-empty string or text parts array',
+          type: 'invalid_request_error',
+        },
+      });
+    }
+  }
+
+  const historyPrompt = buildPrompt(messages);
+  const session = await initSession();
+
+  const upstream = await session.post(
+    'https://asmodeus.free.nf/deepseek.php',
+    { model, question: historyPrompt },
+    {
+      params: { i: '1' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        Accept: 'text/html,application/json,*/*',
+      },
+      validateStatus: () => true,
+    }
+  );
+
+  console.log(`deepseek.php status: ${upstream.status}`);
+  const rawBody =
+    typeof upstream.data === 'string'
+      ? upstream.data
+      : JSON.stringify(upstream.data || {});
+  console.log(`deepseek.php body (500): ${rawBody.slice(0, 500)}`);
+
+  if (upstream.status === 403) {
+    throw new Error('Upstream returned 403 Forbidden.');
+  }
+
+  if (upstream.status >= 500) {
+    throw new Error(`Upstream server error: HTTP ${upstream.status}`);
+  }
+
+  let content = '';
+  const match = rawBody.match(/<div class="response-content">([sS]*?)</div>/i);
+
+  if (match && match[1]) {
+    content = stripHtml(match[1]);
+  } else {
+    content = stripHtml(rawBody);
+  }
+
+  if (!content) {
+    throw new Error('Empty content from upstream');
+  }
+
+  if (stream) {
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    if (typeof res.flushHeaders === 'function') {
+      res.flushHeaders();
+    }
+
+    return simulateStream(res, content, model);
+  }
+
+  const promptTokens = estimateTokens(historyPrompt);
+  const completionTokens = estimateTokens(content);
+
+  return res.status(200).json({
+    id: `chatcmpl-${Date.now()}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content,
+        },
+        finish_reason: 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    },
+  });
+}
 
 module.exports = async (req, res) => {
-  // CORS headers — always set first
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -140,116 +411,53 @@ module.exports = async (req, res) => {
     return res.status(200).end();
   }
 
-  const { url = '/', method } = req;
-  console.log(`→ ${method} ${url}`);
+  const path = getPath(req);
+  console.log(`→ ${req.method} ${path}`);
 
-  // ── Root ping ────────────────────────────────────────────────────────────────
-  if (isRootRoute(url, method)) {
+  if (req.method === 'GET' && (path === '/' || path === '/api')) {
     return res.status(200).json({
-      status: "ok",
-      message: "DeepSeek Proxy is running",
+      status: 'ok',
+      message: 'DeepSeek Proxy is running',
       endpoints: {
-        models: "GET /v1/models",
-        chat: "POST /v1/chat/completions",
+        models: 'GET /v1/models',
+        chat: 'POST /v1/chat/completions',
       },
     });
   }
 
-  // ── GET /v1/models ───────────────────────────────────────────────────────────
-  if (isModelsRoute(url, method)) {
+  if (req.method === 'GET' && path.endsWith('/v1/models')) {
     return res.status(200).json({
-      object: "list",
-      data: MODELS.map(m => ({
+      object: 'list',
+      data: MODELS.map((m) => ({
         id: m,
-        object: "model",
+        object: 'model',
         created: 1710000000,
-        owned_by: "deepseek",
+        owned_by: 'deepseek',
       })),
     });
   }
 
-  // ── POST /v1/chat/completions ────────────────────────────────────────────────
-  if (isChatRoute(url, method)) {
+  if (req.method === 'POST' && path.endsWith('/v1/chat/completions')) {
     try {
-      const { model = "DeepSeek-V3", messages, stream = false } = req.body || {};
-
-      if (!messages || !Array.isArray(messages) || messages.length === 0) {
-        return res.status(400).json({
-          error: { message: "messages array is required and must not be empty", type: "invalid_request_error" },
-        });
-      }
-
-      const session = await initSession();
-
-      // Build conversation string for the proxy
-      const historyPrompt = messages
-        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-        .join('\n\n');
-
-      const response = await session.post(
-        'https://asmodeus.free.nf/deepseek.php',
-        { model, question: historyPrompt },
-        { params: { i: '1' } }
-      );
-
-      // Try to parse the response div
-      const match = response.data.match(/<div class="response-content">([\s\S]*?)<\/div>/);
-      const content = match
-        ? match[1].trim()
-        : (typeof response.data === 'string' ? response.data.trim() : "No response from proxy.");
-
-      if (!content) {
-        throw new Error("Empty content received from upstream proxy");
-      }
-
-      // ── Streaming response ──────────────────────────────────────────────────
-      if (stream) {
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        return simulateStream(res, content, model);
-      }
-
-      // ── Non-streaming response ──────────────────────────────────────────────
-      return res.status(200).json({
-        id: "chatcmpl-" + Date.now(),
-        object: "chat.completion",
-        created: Math.floor(Date.now() / 1000),
-        model,
-        choices: [{
-          index: 0,
-          message: { role: "assistant", content },
-          finish_reason: "stop",
-        }],
-        usage: {
-          prompt_tokens: historyPrompt.split(' ').length,
-          completion_tokens: content.split(' ').length,
-          total_tokens: historyPrompt.split(' ').length + content.split(' ').length,
-        },
-      });
-
+      return await handleChat(req, res);
     } catch (error) {
-      console.error("❌ Proxy Error:", error.message);
-      globalSession = null; // force re-init on next request
+      console.error('Proxy error:', error.message);
+      globalSession = null;
 
       return res.status(500).json({
         error: {
-          message: error.message || "Internal proxy error",
-          type: "proxy_error",
+          message: error.message || 'Internal proxy error',
+          type: 'proxy_error',
         },
       });
     }
   }
 
-  // ── Fallback 404 ─────────────────────────────────────────────────────────────
   return res.status(404).json({
     error: {
-      message: `Route not found: ${method} ${url}`,
-      type: "not_found",
-      valid_routes: [
-        "GET  /v1/models",
-        "POST /v1/chat/completions",
-      ],
+      message: `Route not found: ${req.method} ${path}`,
+      type: 'not_found',
+      valid_routes: ['GET /v1/models', 'POST /v1/chat/completions'],
     },
   });
 };
